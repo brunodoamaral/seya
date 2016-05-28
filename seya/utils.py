@@ -35,6 +35,11 @@ def theano_rng(seed=123):
     return MRG_RandomStreams(seed=seed)
 
 
+def theano_shared_zeros(shape, dtype=theano.config.floatX, name='', n=1):
+    shape = shape if n == 1 else (n,) + shape
+    return theano.shared(np.zeros(shape, dtype=dtype), name=name)
+
+
 def apply_layer(layer, X, train=False):
     tmp = layer.get_input
     layer.get_input = lambda _: X

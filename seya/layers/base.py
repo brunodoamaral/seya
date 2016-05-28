@@ -2,7 +2,7 @@ import numpy as np
 import theano
 import theano.tensor as T
 
-from keras.layers.core import MaskedLayer, Layer
+from keras.layers.core import Masking, Layer
 from keras import backend as K
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
@@ -23,7 +23,7 @@ class WinnerTakeAll2D(Layer):
             return X
 
 
-class Lambda(MaskedLayer):
+class Lambda(Masking):
     def __init__(self, func, output_shape, ndim=2, **kwargs):
         super(Lambda, self).__init__(**kwargs)
         self.input = K.placeholder(ndim=ndim)
@@ -39,7 +39,7 @@ class Lambda(MaskedLayer):
         return self._output_shape
 
 
-class Pass(MaskedLayer):
+class Pass(Masking):
     ''' Do literally nothing
         It can the first layer
     '''
@@ -52,7 +52,7 @@ class Pass(MaskedLayer):
         return X
 
 
-class GaussianProd(MaskedLayer):
+class GaussianProd(Masking):
     '''
         Multiply by Gaussian noise.
         Similar to dropout but with gaussians instead of binomials.
@@ -79,7 +79,7 @@ class GaussianProd(MaskedLayer):
                 "std": self.std}
 
 
-class Replicator(MaskedLayer):
+class Replicator(Masking):
     '''
         WARN: use `keras.layer.RepeatVector` instead.
 
@@ -120,7 +120,7 @@ class Unpool(Layer):
         return output
 
 
-class TimePicker(MaskedLayer):
+class TimePicker(Masking):
     def __init__(self, time=-1):
         '''Picks a single value in time from a recurrent layer
            without forgeting its input mask'''
