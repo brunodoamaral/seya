@@ -1,11 +1,14 @@
 import theano.tensor as T
 from theano import scan
+from theano.tensor.shared_randomstreams import RandomStreams
+import theano
 
 from keras.layers.recurrent import GRU, Recurrent, LSTM
+from keras.engine import InputSpec
 
 from ..utils import theano_rng, theano_shared_zeros
 from ..regularizers import LambdaRegularizer
-
+import numpy as np
 
 class DRAW(Recurrent):
     '''DRAW
@@ -14,7 +17,7 @@ class DRAW(Recurrent):
     ===========
     output_dim : encoder/decoder dimension
     code_dim : random sample dimension (reparametrization trick output)
-    input_shape : (n_channels, rows, cols)
+    input_dim : (n_channels, rows, cols)
     N_enc : Size of the encoder's filter bank (MNIST default: 2)
     N_dec : Size of the decoder's filter bank (MNIST default: 5)
     n_steps : number of sampling steps (or how long it takes to draw, default 64)
@@ -27,8 +30,9 @@ class DRAW(Recurrent):
     def __init__(self, output_dim, code_dim, N_enc=2, N_dec=5, n_steps=64,
                  inner_rnn='gru', truncate_gradient=-1, return_sequences=False,
                  canvas_activation=T.nnet.sigmoid, init='glorot_uniform',
-                 inner_init='orthogonal', input_shape=None, **kwargs):
+                 inner_init='orthogonal', random_seed=42, **kwargs):
         self.output_dim = output_dim  # this is 256 for MNIST
+        self.input_dim = None
         self.code_dim = code_dim  # this is 100 for MNIST
         self.N_enc = N_enc
         self.N_dec = N_dec
@@ -39,20 +43,31 @@ class DRAW(Recurrent):
         self.init = init
         self.inner_init = inner_init
         self.inner_rnn = inner_rnn
+        self.random_seed = random_seed
+        self.states = []
+        self.srng = RandomStreams(seed=self.random_seed)
 
-        self.height = input_shape[1]
-        self.width = input_shape[2]
-
-        self._input_shape = input_shape
         super(DRAW, self).__init__(**kwargs)
 
-    def build(self):
-        self.input = T.tensor4()
+    def build(self, input_shape):
+        self.input_spec = [InputSpec(shape=input_shape)]
 
+        print("self.batch_input_shape", self.batch_input_shape)
+
+        input_dim = input_shape[2]
+        self.input_dim = np.prod(input_dim)
+
+        self.n_channels = input_dim[0]
+        self.height = input_dim[1]
+        self.width = input_dim[2]
+
+        print("(self.input_dim, self.output_dim)", (self.input_dim, self.output_dim))
+
+        enc_input = self.n_channels*2*self.N_enc**2 + self.output_dim
         if self.inner_rnn == 'gru':
             self.enc = GRU(
                 input_length=self.n_steps,
-                input_dim=self._input_shape[0]*2*self.N_enc**2 + self.output_dim,
+                input_dim=enc_input,
                 output_dim=self.output_dim, init=self.init,
                 inner_init=self.inner_init)
             self.dec = GRU(
@@ -64,7 +79,7 @@ class DRAW(Recurrent):
         elif self.inner_rnn == 'lstm':
             self.enc = LSTM(
                 input_length=self.n_steps,
-                input_dim=self._input_shape[0]*2*self.N_enc**2 + self.output_dim,
+                input_dim=enc_input,
                 output_dim=self.output_dim, init=self.init, inner_init=self.inner_init)
             self.dec = LSTM(
                 input_length=self.n_steps,
@@ -73,18 +88,18 @@ class DRAW(Recurrent):
         else:
             raise ValueError('This type of inner_rnn is not supported')
 
-        self.enc.build()
-        self.dec.build()
+        self.enc.build(input_dim)
+        self.dec.build(input_dim)
 
-        self.init_canvas = theano_shared_zeros(self._input_shape)  # canvas and hidden state
+        self.init_canvas = theano_shared_zeros(input_dim)  # canvas and hidden state
         self.init_h_enc = theano_shared_zeros((self.output_dim))  # initial values
         self.init_h_dec = theano_shared_zeros((self.output_dim))  # should be trained
         self.L_enc = self.enc.init((self.output_dim, 5))  # "read" attention parameters (eq. 21)
         self.L_dec = self.enc.init((self.output_dim, 5))  # "write" attention parameters (eq. 28)
         self.b_enc = theano_shared_zeros((5))  # "read" attention parameters (eq. 21)
         self.b_dec = theano_shared_zeros((5))  # "write" attention parameters (eq. 28)
-        self.W_patch = self.enc.init((self.output_dim, self.N_dec**2*self._input_shape[0]))
-        self.b_patch = theano_shared_zeros((self.N_dec**2*self._input_shape[0]))
+        self.W_patch = self.enc.init((self.output_dim, self.N_dec**2*self.n_channels))
+        self.b_patch = theano_shared_zeros((self.N_dec**2*self.n_channels))
         self.W_mean = self.enc.init((self.output_dim, self.code_dim))
         self.W_sigma = self.enc.init((self.output_dim, self.code_dim))
         self.b_mean = theano_shared_zeros((self.code_dim))
@@ -139,7 +154,7 @@ class DRAW(Recurrent):
 
     def _get_patch(self, h):
         write_patch = T.dot(h, self.W_patch) + self.b_patch
-        write_patch = write_patch.reshape((h.shape[0], self._input_shape[0],
+        write_patch = write_patch.reshape((h.shape[0], self.n_channels,
                                            self.N_dec, self.N_dec))
         return write_patch
 
@@ -156,10 +171,10 @@ class DRAW(Recurrent):
         if self._train_state:
             sample = mean + eps * sigma
         else:
-            sample = mean + 0 * eps * sigma
-        kl = -.5 - logsigma + .5 * (mean**2 + sigma**2)
-        # kl = .5 * (mean**2 + sigma**2 - logsigma - 1)
-        return sample, kl.sum(axis=-1)
+            sample = mean
+        # kl = -.5 - logsigma + .5 * (mean**2 + sigma**2)
+        kl = .5 * (mean**2 + sigma**2 - logsigma - 1)   # Eq. 11
+        return sample, kl.sum(axis=-1, acc_dtype=theano.config.floatX)
 
     def _get_rnn_input(self, x, rnn):
         if self.inner_rnn == 'gru':
@@ -179,8 +194,15 @@ class DRAW(Recurrent):
         mask = 1.  # no masking
         if self.inner_rnn == 'gru':
             x_z, x_r, x_h, h_tm1 = args
-            h = rnn._step(x_z, x_r, x_h, mask, h_tm1,
-                          rnn.U_z, rnn.U_r, rnn.U_h)
+            x = T.matrix(dtype=theano.config.floatX)
+            # x = theano_shared_zeros((x_z.shape[0], 3*rnn.output_dim))
+            T.set_subtensor(x[:, :rnn.output_dim], x_z)
+            T.set_subtensor(x[:, rnn.output_dim: 2 * rnn.output_dim], x_r)
+            T.set_subtensor(x[:, 2 * rnn.output_dim:], x_h)
+
+            B_U, B_W = rnn.get_constants(x)
+
+            h, h_states = rnn.step(x, [h_tm1, B_U, B_W])
             return h
         elif self.inner_rnn == 'lstm':
             xi, xf, xc, xo, h_tm1, cell_tm1 = args
@@ -191,18 +213,17 @@ class DRAW(Recurrent):
 
     def _get_initial_states(self, X):
         batch_size = X.shape[0]
-        canvas = self.init_canvas.dimshuffle('x', 0, 1, 2).repeat(batch_size,
-                                                                  axis=0)
+        canvas = self.init_canvas.dimshuffle('x', 0, 1, 2).repeat(batch_size, axis=0)
         init_enc = self.init_h_enc.dimshuffle('x', 0).repeat(batch_size, axis=0)
         init_dec = self.init_h_dec.dimshuffle('x', 0).repeat(batch_size, axis=0)
         if self.inner_rnn == 'lstm':
             init_cell_enc = self.init_cell_enc.dimshuffle('x', 0).repeat(batch_size, axis=0)
             init_cell_dec = self.init_cell_dec.dimshuffle('x', 0).repeat(batch_size, axis=0)
-            return canvas, init_enc, init_cell_enc, init_cell_dec
+            return [canvas, init_enc, init_cell_enc, init_cell_dec, None]
         else:
-            return canvas, init_enc, init_dec
+            return [canvas, init_enc, init_dec]
 
-    def _step(self, eps, canvas, h_enc, h_dec, x, *args):
+    def _step(self, eps, canvas, h_enc, h_dec, x):
         x_hat = x - self.canvas_activation(canvas)
         gx, gy, sigma2, delta, gamma = self._get_attention_trainable_weights(
             h_dec, self.L_enc, self.b_enc, self.N_enc)
@@ -226,7 +247,8 @@ class DRAW(Recurrent):
                                           self.N_dec)
         write_patch = self._get_patch(new_h_dec)
         new_canvas = canvas + self._write(write_patch, gamma_w, Fx_w, Fy_w)
-        return new_canvas, new_h_enc, new_h_dec, kl
+        new_canvas = T.cast(new_canvas, dtype=theano.config.floatX)
+        return [new_canvas, new_h_enc, new_h_dec, kl]
 
     def _step_lstm(self, eps, canvas, h_enc, cell_enc,
                    h_dec, cell_dec, x, *args):
@@ -257,7 +279,41 @@ class DRAW(Recurrent):
         new_canvas = canvas + self._write(write_patch, gamma_w, Fx_w, Fy_w)
         return new_canvas, new_h_enc, new_cell_enc, new_h_dec, new_cell_dec, kl
 
+    def step(self, X, states):
+        train = self.trainable
+        self._train_state = self.trainable
+
+        # X = x.values()
+        eps = self.srng.normal((self.n_steps, X.shape[0], self.code_dim))
+        X = X.reshape((-1, self.n_channels, self.width, self.height))
+
+        if self.inner_rnn == 'gru':
+            outputs_info = self._get_initial_states(X) + [None]
+            outputs, updates = scan(self._step,
+                                    sequences=eps,
+                                    outputs_info=outputs_info,
+                                    non_sequences=[X],
+                                    # n_steps=self.n_steps,
+                                    truncate_gradient=self.truncate_gradient)
+
+        elif self.inner_rnn == 'lstm':
+            outputs, updates = scan(self._step_lstm,
+                                    sequences=eps,
+                                    outputs_info=self._get_initial_states(X),
+                                    non_sequences=[X],
+                                    truncate_gradient=self.truncate_gradient)
+
+        kl = outputs[-1].sum(axis=0).mean()
+        if train:
+            # self.updates = updates
+            self.regularizers = [LambdaRegularizer(kl), ]
+        if self.return_sequences:
+            return outputs[0].dimshuffle(1, 0, 2, 3, 4), kl
+        else:
+            return outputs[0][-1], kl
+
     def get_output(self, train=False):
+        print("Getting output from draw...")
         self._train_state = train
         X, eps = self.get_input(train).values()
         eps = eps.dimshuffle(1, 0, 2)
